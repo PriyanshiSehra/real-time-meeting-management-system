@@ -1,184 +1,214 @@
-# MCMS — Meeting & Communication Management System
+# MCMS – Meeting & Communication Management System
 
-A real-time meeting and communication platform with WebRTC video conferencing, agenda management, productivity tracking, and natural-language scheduling. Built for academic, corporate, and hybrid/remote collaboration.
+A modern meeting and collaboration platform that combines real-time video conferencing, intelligent scheduling, agenda management, and productivity analytics into a single application.
 
-## Tech Stack
+> 🚀 This repository is under active development. New features, UI improvements, and performance optimizations are being added continuously.
+
+---
+
+## ✨ Features
+
+### 🎥 Real-Time Video Conferencing
+- WebRTC powered peer-to-peer video and audio calls
+- Screen sharing support
+- Camera & microphone controls
+- Audio-only fallback mode
+- STUN/TURN server support
+
+### 📅 Smart Meeting Management
+- Create, edit and schedule meetings
+- Online, Offline & Hybrid meeting modes
+- Automatic meeting lifecycle management
+- Auto-generated meeting links
+- Natural language scheduling using **chrono-node**
+
+### 📝 Agenda & Notes
+- Create meeting agendas
+- Allocate time for each agenda item
+- Real-time agenda synchronization
+- Track progress during meetings
+
+### 📊 Productivity Dashboard
+- Meeting attendance statistics
+- Weekly activity heatmap
+- Speaking time analytics
+- Task completion tracking
+- Meeting streaks & achievements
+- AI-inspired productivity insights
+
+### 🔐 Secure Authentication
+- JWT Authentication
+- Protected API routes
+- Secure password hashing using bcrypt
+- Persistent login sessions
+
+### ⚡ Productivity Shortcuts
+Built-in keyboard shortcuts for faster navigation and meeting controls.
+
+---
+
+# 🛠 Tech Stack
 
 | Layer | Technologies |
-|-------|-------------|
-| **Client** | React 19, Vite 5, TypeScript, Socket.io Client, WebRTC |
-| **Server** | Node.js, Express 5, Socket.io, MongoDB (Mongoose), JWT |
-| **Other** | chrono-node (NLP scheduling), bcryptjs, nodemailer |
+|--------|--------------|
+| Frontend | React 19, Vite, TypeScript |
+| Backend | Node.js, Express 5 |
+| Database | MongoDB (Mongoose) |
+| Real-Time | Socket.io |
+| Video | WebRTC |
+| Authentication | JWT, bcryptjs |
+| Scheduling | chrono-node |
+| Utilities | Nodemailer |
 
-## Features
+---
 
-### Video Conferencing
-- Peer-to-peer video/audio via WebRTC with Socket.io signaling
-- Screen sharing, camera/mic toggle, audio-only fallback
-- STUN/TURN support (Google STUN default, optional Metered TURN)
-
-### Meeting Management
-- Create, schedule, update, and delete meetings
-- Online, Offline, and Hybrid modalities
-- Meeting lifecycle: Scheduled → In Progress → Completed / Cancelled
-- Auto-generated Jitsi URLs for online meetings
-- Natural-language scheduling ("tomorrow at 2pm", "next Monday 10am") via chrono-node
-
-### Agenda Tracking
-- Create and manage agenda items per meeting with time allocations
-- Real-time item status updates (Pending → Active → Completed)
-- Live sync across participants via WebSocket
-
-### Productivity Dashboard
-- **Overview** — Meetings attended, total hours, punctuality score, weekly heatmap, badges, streaks
-- **Attendance** — Monthly attendance trends, speaking time vs. average duration
-- **Engagement** — Task completion rate, punctuality, tone analysis, AI-style recommendations
-
-### Authentication
-- Email/password signup and login with JWT (30-day expiry)
-- Protected API routes and authenticated socket connections
-
-### Keyboard Shortcuts
-
-| Shortcut | Action |
-|----------|--------|
-| `M` | Toggle mute |
-| `C` | Toggle camera |
-| `R` | Toggle recording |
-| `F` | Fullscreen |
-| `D` | Toggle dark/light theme |
-| `1` / `2` / `3` | Switch views (Dashboard / Meeting / Schedule) |
-| `Shift+M` | New meeting |
-| `Cmd+B` | Toggle sidebar |
-| `Cmd+K` | Focus search |
-| `Cmd+[` / `Cmd+]` | Toggle agenda / right panel |
-| `A` / `Shift+A` | Add agenda / action item |
-| `Enter` | Join meeting |
-| `Cmd+Shift+L` | Leave meeting |
-| `Cmd+Shift+E` | End meeting |
-
-## Project Structure
+# 📁 Project Structure
 
 ```
-├── client/
-│   ├── src/
-│   │   ├── components/       # UI — VideoArea, TopBar, Sidebar, HostControls, etc.
-│   │   ├── context/          # AuthContext, SocketContext
-│   │   ├── hooks/            # useWebRTC, useKeyboardShortcuts
-│   │   ├── pages/            # Login, Signup
-│   │   ├── types/
-│   │   ├── App.tsx
-│   │   └── main.tsx
-│   ├── vite.config.ts
-│   └── package.json
-├── server/
-│   ├── index.ts              # Express + Socket.io server
-│   ├── middleware/auth.ts     # JWT auth middleware
-│   ├── models/               # User, Meeting, Agenda, Note, Transcript
-│   └── package.json
-└── README.md
+client/
+│── src/
+│   ├── components/
+│   ├── context/
+│   ├── hooks/
+│   ├── pages/
+│   └── App.tsx
+
+server/
+│── middleware/
+│── models/
+│── routes/
+│── services/
+│── index.ts
+
+ai-service/
+
+README.md
 ```
 
-## Getting Started
+---
 
-### Prerequisites
+# 🚀 Getting Started
 
-- **Node.js** (v18+)
-- **MongoDB** (optional — the server falls back to in-memory storage if unavailable)
+## Clone Repository
 
-### Server
+```bash
+git clone https://github.com/PriyanshiSehra/SWE_meeting_and_communication_platform.git
+cd SWE_meeting_and_communication_platform
+```
+
+---
+
+## Backend Setup
 
 ```bash
 cd server
 npm install
-cp .env.example .env    # configure environment variables
-npm run dev             # development (ts-node)
+npm run dev
 ```
 
-For production:
+---
 
-```bash
-npm run build           # compiles TypeScript to dist/
-npm start               # runs dist/index.js
-```
-
-### Client
+## Frontend Setup
 
 ```bash
 cd client
 npm install
-cp .env.example .env    # configure environment variables
-npm run dev             # Vite dev server
+npm run dev
 ```
 
-For production:
-
-```bash
-npm run build
-npm run preview
-```
+---
 
 ## Environment Variables
 
-### Server (`server/.env`)
+### Server
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `5000` | Server port |
-| `MONGO_URI` | `mongodb://127.0.0.1:27017/mcms_db` | MongoDB connection string |
-| `JWT_SECRET` | `mcms_super_secret_key` | JWT signing secret (change in production) |
+```env
+PORT=5000
+MONGO_URI=mongodb://127.0.0.1:27017/mcms_db
+JWT_SECRET=your_secret_key
+```
 
-### Client (`client/.env`)
+### Client
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `VITE_API_URL` | `http://localhost:5000/api` | Backend API base URL |
+```env
+VITE_API_URL=http://localhost:5000/api
+```
 
-### Optional — WebRTC TURN Server
+---
 
-| Variable | Description |
-|----------|-------------|
-| `VITE_METERED_API_KEY` | Metered TURN API key |
-| `VITE_METERED_APP` | Metered app subdomain |
+# 📡 REST API
 
-## API Routes
+### Authentication
 
-| Method | Endpoint | Auth | Description |
-|--------|----------|------|-------------|
-| `POST` | `/api/auth/signup` | No | Register a new user |
-| `POST` | `/api/auth/login` | No | Log in |
-| `GET` | `/api/auth/verify` | Yes | Verify JWT token |
-| `GET` | `/api/auth/me` | Yes | Get current user |
-| `POST` | `/api/auth/logout` | No | Log out |
-| `GET` | `/api/meetings` | Yes | List all meetings |
-| `POST` | `/api/meetings` | Yes | Create a meeting |
-| `GET` | `/api/meetings/:id` | Yes | Get meeting details |
-| `PUT` | `/api/meetings/:id` | Yes | Update a meeting |
-| `DELETE` | `/api/meetings/:id` | Yes | Delete a meeting |
-| `POST` | `/api/meetings/:id/start` | Yes | Start a meeting |
-| `POST` | `/api/agenda/:meetingId` | Yes | Create/update agenda |
-| `GET` | `/api/agenda/:meetingId` | Yes | Get agenda |
-| `PUT` | `/api/agenda/:meetingId/item/:itemId` | Yes | Update agenda item status |
+- POST `/api/auth/signup`
+- POST `/api/auth/login`
+- GET `/api/auth/me`
+- GET `/api/auth/verify`
 
-## Socket Events
+### Meetings
+
+- GET `/api/meetings`
+- POST `/api/meetings`
+- PUT `/api/meetings/:id`
+- DELETE `/api/meetings/:id`
+
+### Agenda
+
+- GET `/api/agenda/:meetingId`
+- POST `/api/agenda/:meetingId`
+- PUT `/api/agenda/:meetingId/item/:itemId`
+
+---
+
+# 🔌 Socket Events
 
 ### Client → Server
 
-| Event | Payload | Description |
-|-------|---------|-------------|
-| `join_room` | `{ meetingId, name?, profileImage? }` | Join a video room |
-| `leave_room` | `{ meetingId }` | Leave a video room |
-| `signal` | `{ to, signal }` | WebRTC signaling (offer/answer/ICE) |
-| `start_transcription` | `{ meetingId }` | Start transcription session |
-| `stop_transcription` | `{ meetingId }` | Stop transcription session |
+- join_room
+- leave_room
+- signal
+- start_transcription
+- stop_transcription
 
 ### Server → Client
 
-| Event | Payload | Description |
-|-------|---------|-------------|
-| `room_peers` | `{ peers: [...] }` | List of existing peers on join |
-| `peer_joined` | `{ socketId, userId, name, profileImage }` | New peer joined |
-| `peer_left` | `{ socketId }` | Peer disconnected |
-| `signal` | `{ from, signal }` | Forwarded WebRTC signal |
-| `transcription_started` | `{ meetingId }` | Transcription session began |
-| `transcription_stopped` | `{ meetingId }` | Transcription session ended |
+- room_peers
+- peer_joined
+- peer_left
+- signal
+- transcription_started
+- transcription_stopped
+
+---
+
+# 📌 Future Enhancements
+
+- AI meeting summaries
+- Live speech transcription
+- Calendar integrations
+- Meeting recordings
+- File sharing
+- Whiteboard collaboration
+- Performance optimizations
+- Mobile responsiveness improvements
+
+---
+
+# 🤝 Contributing
+
+Contributions, suggestions and feature requests are welcome.
+
+If you'd like to contribute:
+
+1. Fork the repository
+2. Create a feature branch
+3. Commit your changes
+4. Open a Pull Request
+
+---
+
+## 📄 License
+
+This project is intended for educational and development purposes.
+
+---
