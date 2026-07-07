@@ -1,0 +1,1577 @@
+import express from 'express';
+import http from 'http';
+import path from 'path';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import jwt from 'jsonwebtoken';
+import { Server } from 'socket.io';
+import nodemailer from 'nodemailer';
+import cron from 'node-cron';
+import { AccessToken } from 'livekit-server-sdk';
+import { createAdapter } from '@socket.io/redis-adapter';
+import { createClient } from 'redis';
+import WebSocket from 'ws'; // for sarvam transcription
+
+// for transcript aggregation
+import {
+	resumeClock,
+	pauseClock,
+	getElapsedMs,
+	clearMeetingClock,
+	formatMeetingElapsed,
+	mergeStreamingUtterance,
+	shouldFlushOnSentenceEnd,
+	splitAtParagraphBoundary,
+	MAX_PARAGRAPH_CHARS,
+	type TranscriptAgg,
+	type RecordingClock,
+} from './services/transcriptAggregation';
+
+dotenv.config();
+
+// optional MongoDB connection
+let usingMongoFlag = false;
+let User: any = null, Meeting: any = null, Poll: any = null, Notification: any = null, RSVP: any = null;
+let Transcript: any = null, Agenda: any = null, Minutes: any = null, ActionItem: any = null, Attendance: any = null, MeetingSummary: any = null;
+
+async function startServer() {
+	try {
+		const mongoose = require('mongoose');
+		const mongoUri = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/mcms_db';
+		const builtUri = (process.env.MONGO_PASSWORD && mongoUri.includes('mongodb+srv://'))
+			? mongoUri.replace(/^mongodb\+srv:\/\/([^:]+):[^@]+@/, (_: string, user: string) =>
+				`mongodb+srv://${user}:${encodeURIComponent(process.env.MONGO_PASSWORD!)}@`)
+			: mongoUri;
+
+		console.log('Connecting to MongoDB...');
+		await mongoose.connect(builtUri, { serverSelectionTimeoutMS: 15000 });
+		console.log('MongoDB Connected');
+		usingMongoFlag = true;
+	} catch (err: any) {
+		console.log('MongoDB not available — using in-memory store:', err.message);
+		if (process.env.NODE_ENV === 'production') {
+			console.error('Atlas connection failed. Check: IP whitelist, password encoding, MONGO_URI format.');
+		}
+	}
+
+	try {
+		User = require('./models/User');
+		Meeting = require('./models/Meeting');
+		Poll = require('./models/Poll');
+		Notification = require('./models/Notification');
+		RSVP = require('./models/RSVP');
+		Transcript = require('./models/Transcript');
+		Agenda = require('./models/Agenda');
+		Minutes = require('./models/Minutes');
+		ActionItem = require('./models/ActionItem');
+		Attendance = require('./models/Attendance');
+		MeetingSummary = require('./models/MeetingSummary');
+	} catch (e) {
+		console.log('Error loading models:', (e as Error).message);
+	}
+}
+
+async function runApplication() {
+	await startServer();
+
+	const usingMongo = () => usingMongoFlag;
+
+// ── In-memory fallback store ─────────────────────────────────
+const inMemoryUsers: any[] = [];
+
+const app = express();
+const server = http.createServer(app);
+const PORT = process.env.PORT || 5001;
+const JWT_SECRET = process.env.JWT_SECRET || 'mcms_super_secret_key';
+const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
+
+app.use(cors());
+app.use(express.json());
+app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
+
+// Debug endpoint for persistence troubleshooting (Render + Atlas)
+app.get('/api/health', (req: any, res: any) => {
+	let readyState: number | null;
+	try {
+		const mongoose = require('mongoose');
+		readyState = mongoose.connection?.readyState;
+	} catch {
+		readyState = null;
+	}
+	res.json({
+		mongoConnected: usingMongoFlag && readyState === 1,
+		mongoReadyState: readyState,
+		mongoUriSet: !!process.env.MONGO_URI,
+		nodeEnv: process.env.NODE_ENV || 'development',
+	});
+});
+
+// ── Socket.io Setup ──────────────────────────────────────────
+const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST'] } });
+const connectedUsers = new Map<string, string>();
+
+io.use((socket: any, next: any) => {
+	const token = socket.handshake.auth?.token;
+	if (!token) return next(new Error('Authentication required'));
+	try {
+		const decoded: any = jwt.verify(token, JWT_SECRET);
+		socket.userId = decoded.id;
+		next();
+	} catch { next(new Error('Invalid token')); }
+});
+
+// live state maps for webRTC and transcription
+const meetingRooms = new Map<string, Map<string, any>>();
+const transcriptionSessions = new Map<string, any>();
+const activeAgendaItems = new Map<string, string>();
+
+// elapsed transcription time per meeting (pauses when recording is off)
+const meetingRecordingClock = new Map<string, RecordingClock>();
+
+// auth & helpers
+const generateToken = (id: any) => jwt.sign({ id }, JWT_SECRET, { expiresIn: '30d' });
+const { protect } = require('./middleware/auth');
+
+function emitToUser(userId: any, event: string, data: any) {
+	io.to(`user:${userId.toString()}`).emit(event, data);
+}
+
+async function isMeetingHost(meetingId: string, userId: string) {
+	if (usingMongoFlag && Meeting) {
+		if (!/^[0-9a-fA-F]{24}$/.test(meetingId)) return false;
+		const meetingDoc = await Meeting.findById(meetingId).select('hostId');
+		if (!meetingDoc) return false;
+		if (!meetingDoc.hostId) return true;
+		return meetingDoc.hostId.toString() === userId.toString();
+	}
+	const memMtg = inMemoryMeetings.find((m: any) => String(m.id || m._id) === String(meetingId));
+	if (!memMtg) return false;
+	if (!memMtg.hostId) return true;
+	return String(memMtg.hostId) === String(userId);
+}
+
+function parseMeetingStart(meeting: any): Date | null {
+	const dateStr = meeting?.confirmedDate || meeting?.date;
+	const timeStr = meeting?.confirmedTime || meeting?.time || '00:00';
+	if (!dateStr) return null;
+	const [year, month, day] = String(dateStr).split('-').map(Number);
+	const [hours, minutes] = String(timeStr).split(':').map(Number);
+	if (![year, month, day].every(Number.isFinite)) return null;
+	return new Date(
+		year,
+		(month || 1) - 1,
+		day || 1,
+		Number.isFinite(hours) ? hours : 0,
+		Number.isFinite(minutes) ? minutes : 0,
+		0,
+		0,
+	);
+}
+
+function getMeetingDurationMinutes(meeting: any): number {
+	const value = Number(meeting?.durationMinutes);
+	return Number.isFinite(value) && value > 0 ? value : 30;
+}
+
+async function getMeetingForUserAccess(meetingId: string) {
+	if (usingMongoFlag && Meeting) {
+		try {
+			const mongoose = require('mongoose');
+			if (!mongoose.Types.ObjectId.isValid(meetingId)) {
+				// Fall through to in-memory if invalid ObjectId
+			} else {
+				const meeting = await Meeting.findById(meetingId).select(
+					'hostId participants status confirmedDate confirmedTime date time durationMinutes'
+				);
+				if (meeting) {
+					return {
+						hostId: meeting.hostId ? String(meeting.hostId) : null,
+						participants: Array.isArray(meeting.participants) ? meeting.participants.map((p: any) => String(p)) : [],
+						status: meeting.status,
+						confirmedDate: meeting.confirmedDate,
+						confirmedTime: meeting.confirmedTime,
+						date: meeting.date,
+						time: meeting.time,
+						durationMinutes: meeting.durationMinutes,
+					};
+				}
+			}
+		} catch (e) {
+			console.error('Mongo fetch meeting error:', e);
+		}
+	}
+	// Fallback to in-memory store
+	if (!inMemoryMeetings) return null;
+	const memMeeting = inMemoryMeetings.find((m: any) => String(m.id || m._id) === String(meetingId));
+	if (!memMeeting) return null;
+	return {
+		hostId: memMeeting.hostId ? String(memMeeting.hostId) : null,
+		participants: Array.isArray(memMeeting.participants)
+			? memMeeting.participants.map((p: any) => String(p?._id || p?.id || p))
+			: [],
+		status: memMeeting.status,
+		confirmedDate: memMeeting.confirmedDate || memMeeting.date,
+		confirmedTime: memMeeting.confirmedTime || memMeeting.time,
+		date: memMeeting.date,
+		time: memMeeting.time,
+		durationMinutes: memMeeting.durationMinutes,
+	};
+}
+
+async function canJoinMeetingNow(meetingId: string, userId: string) {
+	const meeting = await getMeetingForUserAccess(meetingId);
+	if (!meeting) return { ok: false, reason: 'Meeting not found.' };
+	const uid = String(userId);
+
+	// Fix: Robust check for participant/host status handling ObjectIds and strings
+	const hostId = meeting.hostId ? String(meeting.hostId) : null;
+	const participantIds = Array.isArray(meeting.participants)
+		? meeting.participants.map((p: any) => String(p._id || p.id || p))
+		: [];
+
+	const isParticipant = (hostId === uid) || participantIds.includes(uid);
+
+	if (!isParticipant) return { ok: false, reason: 'Only invited participants can join this meeting.' };
+	if (meeting.status === 'completed' || meeting.status === 'cancelled') {
+		return { ok: false, reason: 'This meeting has already ended.' };
+	}
+	if (meeting.status === 'pending_poll') return { ok: false, reason: 'This meeting is not scheduled yet.' };
+	const start = parseMeetingStart(meeting);
+	if (!start) return { ok: false, reason: 'Meeting time is unavailable.' };
+	const now = Date.now();
+	const joinOpensAt = start.getTime() - 15 * 60 * 1000;
+	const meetingEndsAt = start.getTime() + getMeetingDurationMinutes(meeting) * 60 * 1000 + 10 * 60 * 1000;
+	if (now < joinOpensAt) return { ok: false, reason: 'You can join up to 15 minutes before the meeting starts.' };
+	if (now > meetingEndsAt) return { ok: false, reason: 'This meeting window has ended.' };
+	return { ok: true, reason: '' };
+}
+
+// email setup
+let transporter: any = null;
+async function getMailTransporter() {
+	if (transporter) return transporter;
+	if (process.env.SENDGRID_API_KEY) {
+		transporter = nodemailer.createTransport({
+			host: 'smtp.sendgrid.net', port: 587, secure: false,
+			auth: { user: 'apikey', pass: process.env.SENDGRID_API_KEY },
+		});
+	} else if (process.env.SMTP_HOST) {
+		transporter = nodemailer.createTransport({
+			host: process.env.SMTP_HOST,
+			port: parseInt(process.env.SMTP_PORT!) || 587,
+			secure: process.env.SMTP_SECURE === 'true',
+			auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+		});
+	} else {
+		const testAccount = await nodemailer.createTestAccount();
+		transporter = nodemailer.createTransport({
+			host: 'smtp.ethereal.email', port: 587, secure: false,
+			auth: { user: testAccount.user, pass: testAccount.pass },
+		});
+		console.log('Using Ethereal test email — preview URLs in console');
+	}
+	return transporter;
+}
+
+function generateRsvpToken(meetingId: any, userId: any) {
+	return jwt.sign({ meetingId: meetingId.toString(), userId: userId.toString(), purpose: 'rsvp' }, JWT_SECRET, { expiresIn: '30d' });
+}
+
+const { generateICS } = require('./services/icsGenerator');
+const { callAISummarize, callAIExtractActions, callAIMeetingSummary } = require('./services/aiService');
+
+async function sendRsvpEmail(meeting: any, user: any, slot: any, icsBuffer: Buffer | null) {
+	try {
+		const transport = await getMailTransporter();
+		const token = generateRsvpToken(meeting._id, user._id);
+		const baseUrl = process.env.SERVER_URL || `http://localhost:${PORT}`;
+
+		const makeLink = (response: string) =>
+			`${baseUrl}/api/rsvp/${meeting._id}/respond?token=${token}&response=${response}`;
+
+		const dateStr = slot ? `${slot.date} at ${slot.time}` : `${meeting.date} at ${meeting.time}`;
+		const meetingUrl = meeting.modality !== 'Offline' ? `${CLIENT_URL.replace(/\/$/, '')}?meeting=${meeting._id}` : null;
+		const meetingLinkSection = meetingUrl
+			? `<p style="margin:16px 0"><strong>Meeting Link:</strong> <a href="${meetingUrl}" style="color:#6366f1">${meetingUrl}</a></p>`
+			: '';
+		const locationSection = meeting.location
+			? `<p><strong>Location:</strong> ${meeting.location}</p>`
+			: '';
+
+		const html = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:600px;margin:0 auto;padding:20px;color:#1a1a2e">
+  <div style="background:linear-gradient(135deg,#6366f1,#8b5cf6);padding:24px;border-radius:12px 12px 0 0;text-align:center">
+    <h1 style="color:#fff;margin:0;font-size:20px">Meeting Invitation</h1>
+  </div>
+  <div style="background:#fff;padding:24px;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 12px 12px">
+    <h2 style="margin:0 0 16px;color:#1a1a2e">${meeting.title}</h2>
+    <p><strong>Date/Time:</strong> ${dateStr}</p>
+    <p><strong>Type:</strong> ${meeting.modality}</p>
+    ${locationSection}${meetingLinkSection}
+    <p style="margin:24px 0 12px;font-weight:600">Will you attend?</p>
+    <div style="display:flex;gap:12px">
+      <a href="${makeLink('yes')}" style="display:inline-block;padding:10px 28px;background:#22c55e;color:#fff;text-decoration:none;border-radius:8px;font-weight:600">Yes</a>
+      <a href="${makeLink('no')}" style="display:inline-block;padding:10px 28px;background:#ef4444;color:#fff;text-decoration:none;border-radius:8px;font-weight:600">No</a>
+      <a href="${makeLink('maybe')}" style="display:inline-block;padding:10px 28px;background:#f59e0b;color:#fff;text-decoration:none;border-radius:8px;font-weight:600">Maybe</a>
+    </div>
+  </div>
+</body></html>`;
+
+		const attachments: any[] = [];
+		if (icsBuffer) {
+			attachments.push({
+				filename: 'meeting.ics',
+				content: icsBuffer,
+				contentType: 'text/calendar',
+			});
+		}
+
+		const info = await transport.sendMail({
+			from: process.env.SMTP_FROM || '"MCMS Platform" <noreply@mcms.app>',
+			to: user.email,
+			subject: `Meeting Invitation: ${meeting.title}`,
+			html,
+			attachments,
+		});
+
+		const previewUrl = nodemailer.getTestMessageUrl(info);
+		if (previewUrl) console.log(`Preview RSVP email for ${user.email}: ${previewUrl}`);
+	} catch (err: any) {
+		console.error('Failed to send RSVP email:', err.message);
+	}
+}
+
+// ── In-memory fallback stores (empty for new users; populated as they create data) ──
+const inMemoryMeetings: any[] = [];
+const inMemoryAgendas: Record<string, any[]> = {};
+const inMemoryMinutes: Record<string, any[]> = {};
+const inMemoryTranscripts: Record<string, any[]> = {};
+const inMemoryActionItems: Record<string, any[]> = {};
+const inMemoryMeetingSummaries: Record<string, any> = {};
+
+// ── Shared deps object for routes ────────────────────────────
+const deps = {
+	User, Meeting, Poll, Notification, RSVP, Agenda, Minutes, protect, usingMongo,
+	generateToken, emitToUser, sendRsvpEmail, generateICS,
+	inMemoryUsers, JWT_SECRET, PORT, CLIENT_URL,
+	inMemoryMeetings, inMemoryAgendas, inMemoryMinutes, inMemoryTranscripts, inMemoryActionItems, inMemoryMeetingSummaries,
+	MeetingSummary,
+	callAISummarize, callAIMeetingSummary, io,
+};
+
+// ── Mount Routes ─────────────────────────────────────────────
+app.use('/api/auth', require('./routes/auth')(deps));
+app.use('/api/users', require('./routes/auth')(deps));
+app.use('/api/meetings', require('./routes/meetings')(deps));
+app.use('/api/polls', require('./routes/polls')(deps));
+app.use('/api/agenda', require('./routes/agenda')(deps));
+app.use('/api/minutes', require('./routes/minutes')(deps));
+app.use('/api/action-items', require('./routes/actionItems')(deps));
+app.use('/api/attendance', require('./routes/attendance')(deps));
+app.use('/api/archive', require('./routes/archive')(deps));
+app.use('/api/search', require('./routes/search')(deps));
+app.use('/api/rubric', require('./routes/rubric')(deps));
+app.use('/api/pins', require('./routes/pins')(deps));
+app.use('/api/dashboard', require('./routes/dashboard')(deps));
+app.use('/api/notifications', require('./routes/notifications')(deps));
+app.use('/api/rsvp', require('./routes/rsvp')(deps));
+app.use('/api/profile', require('./routes/profile')(deps));
+app.use('/api/transcript', require('./routes/transcript')(deps));
+
+// ---- sarvam transcription: meeting-relative clock + paragraph / speaker-turn aggregation
+
+function clearStreamBuffersForSpeaker(session: any, speakerName: string) {
+	for (const [, ent] of session.speakers) {
+		if (ent.name === speakerName) ent.streamBuffer = '';
+	}
+}
+
+function setStreamBuffersForSpeaker(session: any, speakerName: string, value: string) {
+	for (const [, ent] of session.speakers) {
+		if (ent.name === speakerName) ent.streamBuffer = value;
+	}
+}
+
+function broadcastTranscriptSegment(meetingId: string, segment: any) {
+	io.to(`meeting:${meetingId}`).emit('transcript_update', segment);
+}
+
+function newLiveDraftId(): string {
+	return `live-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function ensureLiveDraftId(session: any) {
+	if (!session.liveDraftId) session.liveDraftId = newLiveDraftId();
+}
+
+// live UI: stream partial text on every STT chunk (Google Meet–style). Archive still uses paragraph flushes only.
+function broadcastInterimTranscript(meetingId: string, session: any) {
+	const agg = session.aggregator as TranscriptAgg | null;
+	if (!agg || !String(agg.text).trim()) return;
+	ensureLiveDraftId(session);
+	broadcastTranscriptSegment(meetingId, {
+		id: session.liveDraftId,
+		meetingId,
+		speaker: agg.speaker,
+		speakerImage: agg.speakerImage,
+		text: agg.text.trim(),
+		timestamp: formatMeetingElapsed(agg.segmentStartElapsedMs),
+		meetingElapsedMs: agg.segmentStartElapsedMs,
+		languageCode: agg.languageCode,
+		sentiment: null,
+		agendaItemId: agg.agendaItemId,
+		interim: true,
+	});
+}
+
+async function processRealtimeActions(meetingId: string, agg: TranscriptAgg) {
+	try {
+		let currentMinutes: any[] = [];
+		if (usingMongoFlag && Minutes) {
+			const minutesDoc = await Minutes.findOne({ meetingId });
+			if (minutesDoc && minutesDoc.items) currentMinutes = minutesDoc.items;
+		} else {
+			currentMinutes = inMemoryMinutes[meetingId] || [];
+		}
+		const actions = await callAIExtractActions(`${agg.speaker}: ${agg.text}`, currentMinutes);
+		if (actions && actions.length > 0) {
+			let added = false;
+			let meetingUsers: any[] = [];
+			if (usingMongoFlag && Meeting) {
+				const meeting = await Meeting.findById(meetingId).populate('hostId participants');
+				if (meeting) {
+					if (meeting.hostId) meetingUsers.push(meeting.hostId);
+					if (meeting.participants) meetingUsers.push(...meeting.participants);
+				}
+			}
+			for (const a of actions) {
+				if (usingMongoFlag && ActionItem) {
+					const safeTitle = a.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+					const exists = await ActionItem.findOne({
+						meetingId,
+						title: { $regex: new RegExp(`^${safeTitle}$`, 'i') }
+					});
+					if (exists) continue;
+
+					let assigneeId = null;
+					if (a.assignee) {
+						const safeAssignee = a.assignee.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+						const extracted = a.assignee.trim().toLowerCase();
+						
+						const matchedParticipant = meetingUsers.find((u: any) => {
+							const userName = (u.name || '').toLowerCase();
+							const userEmail = (u.email || '').toLowerCase();
+							const extracted = a.assignee.toLowerCase();
+							return userName === extracted ||
+								userEmail === extracted ||
+								userName.includes(extracted) ||
+								extracted.includes(userName);
+						});
+
+						if (matchedParticipant) {
+							assigneeId = matchedParticipant._id;
+						} else if (User) {
+							const globalUser = await User.findOne({
+								$or: [
+									{ name: { $regex: new RegExp(`^${safeAssignee}$`, 'i') } },
+									{ name: { $regex: new RegExp(safeAssignee, 'i') } },
+									{ email: { $regex: new RegExp(`^${safeAssignee}$`, 'i') } }
+								]
+							});
+							if (globalUser) assigneeId = globalUser._id;
+						}
+					}
+
+					await ActionItem.create({
+						meetingId,
+						title: a.title,
+						assigneeName: a.assignee || null,
+						assignee: assigneeId,
+						category: a.category || 'Technical',
+						status: 'pending',
+						deadline: a.deadline || null,
+						source: 'ai-extracted',
+						aiConfidence: a.confidence || null,
+					});
+
+					// Send notification if assigned to a user
+					if (assigneeId && Notification) {
+						try {
+							const notif = await Notification.create({
+								userId: assigneeId,
+								type: 'action_item_assigned',
+								meetingId,
+								message: `You've been assigned a new action item: "${a.title}"`,
+							});
+							if (io) {
+								io.to(`user:${assigneeId.toString()}`).emit('notification', {
+									_id: notif._id,
+									type: notif.type,
+									meetingId,
+									message: notif.message,
+									read: false,
+									createdAt: notif.createdAt,
+								});
+							}
+						} catch (notifErr) {
+							console.error('Failed to create notification for AI action item:', notifErr);
+						}
+					}
+					added = true;
+				} else {
+					const exists = inMemoryActionItems[meetingId]?.find((item: any) => item.title.toLowerCase() === a.title.toLowerCase());
+					if (exists) continue;
+					const item = {
+						id: `ai-live-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+						title: a.title,
+						assignee: a.assignee || 'Unassigned',
+						category: a.category || 'Technical',
+						status: 'pending',
+						deadline: a.deadline || null,
+						source: 'ai-extracted',
+					};
+					if (!inMemoryActionItems[meetingId]) inMemoryActionItems[meetingId] = [];
+					inMemoryActionItems[meetingId].push(item);
+					added = true;
+				}
+			}
+			if (added && io) {
+				let items = [];
+				if (usingMongoFlag && ActionItem) {
+					const dbItems = await ActionItem.find({ meetingId }).populate('assignee', 'name email').sort({ createdAt: 1 });
+					items = dbItems.map((i: any) => ({
+						id: i._id.toString(), title: i.title,
+						assignee: i.assigneeName || i.assignee?.name || 'Unassigned',
+						assigneeId: (i.assignee?._id || i.assignee)?.toString(),
+						category: i.category, status: i.status,
+						deadline: i.deadline, agendaItemId: i.agendaItemId,
+						source: i.source, aiConfidence: i.aiConfidence,
+					}));
+				} else {
+					items = inMemoryActionItems[meetingId] || [];
+				}
+				io.to(`meeting:${meetingId}`).emit('action_items_sync', { meetingId, items });
+			}
+		}
+	} catch (e: any) {
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('Real-time AI action extraction failed:', e.message);
+		}
+	}
+}
+
+// push finalized transcript segments to all clients in a meeting and save them to the database if MongoDB is enabled.
+// called when a paragraph, speaker turn, or sentence boundary is reached during live transcription.
+function flushAggToClients(meetingId: string, agg: TranscriptAgg, session: any) {
+	const text = agg.text.trim();
+	if (!text) return;
+	const id = session.liveDraftId || `t-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+	session.liveDraftId = null;
+	const segment = {
+		id,
+		meetingId,
+		speaker: agg.speaker,
+		speakerImage: agg.speakerImage,
+		text,
+		timestamp: formatMeetingElapsed(agg.segmentStartElapsedMs),
+		meetingElapsedMs: agg.segmentStartElapsedMs,
+		languageCode: agg.languageCode,
+		sentiment: null,
+		agendaItemId: agg.agendaItemId,
+		interim: false,
+	};
+	broadcastTranscriptSegment(meetingId, segment); // push to all clients in the meeting
+
+	// save to database if MongoDB is enabled
+	if (usingMongoFlag && Transcript) {
+		Transcript.create({
+			meetingId,
+			speaker: agg.speaker,
+			speakerImage: agg.speakerImage,
+			text,
+			timestamp: segment.timestamp,
+			startTime: agg.segmentStartElapsedMs,
+			languageCode: agg.languageCode,
+			agendaItemId: agg.agendaItemId,
+		}).catch(() => { });
+	} else {
+		if (!inMemoryTranscripts[meetingId]) inMemoryTranscripts[meetingId] = [];
+		inMemoryTranscripts[meetingId].push({
+			id,
+			meetingId,
+			speaker: agg.speaker,
+			speakerImage: agg.speakerImage,
+			text,
+			timestamp: segment.timestamp,
+			startTime: agg.segmentStartElapsedMs,
+			languageCode: agg.languageCode,
+			agendaItemId: agg.agendaItemId,
+			createdAt: new Date().toISOString(),
+		});
+	}
+
+	// Trigger real-time action extraction (Disabled per user request - manual only in live meet)
+	// processRealtimeActions(meetingId, agg);
+}
+
+// split transcript into paragraphs
+function applyParagraphRules(meetingId: string, session: any) {
+	let agg = session.aggregator as TranscriptAgg | null;
+	if (!agg || !agg.text.trim()) return;
+
+	//
+	while (agg && agg.text.length >= MAX_PARAGRAPH_CHARS) {
+		const split = splitAtParagraphBoundary(agg.text, MAX_PARAGRAPH_CHARS);
+		if (!split) break;
+		flushAggToClients(meetingId, { ...agg, text: split.flush }, session);
+		const nextStart = getElapsedMs(meetingRecordingClock, meetingId);
+		if (!split.rest) {
+			session.aggregator = null;
+			clearStreamBuffersForSpeaker(session, agg.speaker);
+			return;
+		}
+		agg = {
+			speaker: agg.speaker,
+			speakerImage: agg.speakerImage,
+			text: split.rest,
+			segmentStartElapsedMs: nextStart,
+			agendaItemId: activeAgendaItems.get(meetingId) || null,
+			languageCode: agg.languageCode,
+		};
+		session.aggregator = agg;
+		setStreamBuffersForSpeaker(session, agg.speaker, split.rest);
+	}
+
+	agg = session.aggregator;
+	if (agg && shouldFlushOnSentenceEnd(agg.text)) {
+		flushAggToClients(meetingId, agg, session);
+		session.aggregator = null;
+		clearStreamBuffersForSpeaker(session, agg.speaker);
+	}
+}
+
+function flushSessionAggregator(meetingId: string, session: any) {
+	const agg = session?.aggregator as TranscriptAgg | null;
+	if (!agg || !agg.text.trim()) {
+		if (session) session.aggregator = null;
+		return;
+	}
+	flushAggToClients(meetingId, agg, session);
+	session.aggregator = null;
+	clearStreamBuffersForSpeaker(session, agg.speaker);
+}
+
+
+function ingestSarvamTranscript(
+	meetingId: string,
+	socketId: string,
+	speakerName: string,
+	speakerImage: string | null,
+	rawText: string,
+	languageCode: string | null,
+) {
+	const session = transcriptionSessions.get(meetingId);
+	if (!session || !session.active) return;
+
+	const spEntry = session.speakers.get(socketId);
+	if (!spEntry) return;
+
+	const merged = mergeStreamingUtterance(spEntry.streamBuffer || '', rawText);
+	spEntry.streamBuffer = merged;
+
+	const elapsed = getElapsedMs(meetingRecordingClock, meetingId);
+	const agendaItemId = activeAgendaItems.get(meetingId) || null;
+
+	let agg = session.aggregator as TranscriptAgg | null;
+
+	if (!agg) {
+		session.aggregator = {
+			speaker: speakerName,
+			speakerImage,
+			text: merged,
+			segmentStartElapsedMs: elapsed,
+			agendaItemId,
+			languageCode,
+		};
+		applyParagraphRules(meetingId, session);
+		broadcastInterimTranscript(meetingId, session);
+		return;
+	}
+
+	if (agg.speaker !== speakerName) {
+		flushAggToClients(meetingId, agg, session);
+		clearStreamBuffersForSpeaker(session, agg.speaker);
+		for (const [, ent] of session.speakers) {
+			if (ent.name !== speakerName) ent.streamBuffer = '';
+		}
+		session.aggregator = {
+			speaker: speakerName,
+			speakerImage,
+			text: merged,
+			segmentStartElapsedMs: elapsed,
+			agendaItemId,
+			languageCode: languageCode || agg.languageCode,
+		};
+		applyParagraphRules(meetingId, session);
+		broadcastInterimTranscript(meetingId, session);
+		return;
+	}
+
+	agg.text = merged;
+	agg.languageCode = languageCode || agg.languageCode;
+	agg.agendaItemId = agendaItemId ?? agg.agendaItemId;
+	session.aggregator = agg;
+	applyParagraphRules(meetingId, session);
+	broadcastInterimTranscript(meetingId, session);
+}
+
+// create Sarvam WebSocket connection
+// onOpen is called exactly once when the WS actually establishes — callers use
+// this to know a real connection is live before confirming recording to the UI.
+function createSarvamWS(
+	meetingId: string,
+	socketId: string,
+	speakerName: string,
+	speakerImage: string | null,
+	onOpen?: () => void,
+	onFail?: () => void,
+) {
+	const apiKey = process.env.SARVAM_API_KEY;
+	if (!apiKey) {
+		console.log('SARVAM_API_KEY not set — transcription disabled');
+		onFail?.();
+		return null;
+	}
+
+	const url = 'wss://api.sarvam.ai/speech-to-text-translate/ws?model=saaras:v3&mode=transcribe&sample_rate=16000&input_audio_codec=pcm_s16le';
+	let ws: WebSocket;
+
+	// create WebSocket connection
+	try {
+		ws = new WebSocket(url, { headers: { 'Api-Subscription-Key': apiKey } });
+	} catch (err: any) {
+		console.error('Sarvam WS creation failed:', err.message);
+		onFail?.();
+		return null;
+	}
+
+	ws.on('open', () => {
+		console.log(`Sarvam WS open for [${speakerName}] in meeting ${meetingId}`);
+		onOpen?.();
+	});
+
+	// handle WebSocket message event
+	ws.on('message', (raw: WebSocket.RawData) => {
+		try {
+			const msg = JSON.parse(raw.toString());
+			if (msg.type === 'data' && msg.data?.transcript) {
+				const text = String(msg.data.transcript).trim();
+				if (!text) return;
+				ingestSarvamTranscript(
+					meetingId,
+					socketId,
+					speakerName,
+					speakerImage,
+					text,
+					msg.data.language_code || null,
+				);
+			} else if (msg.type === 'error') {
+				console.error(`Sarvam error [${speakerName}]:`, msg.data?.error || msg);
+			}
+		} catch { }
+	});
+
+	ws.on('error', (err: Error) => {
+		console.error(`Sarvam WS error [${speakerName}]:`, err.message);
+		onFail?.();
+	});
+	ws.on('close', (code: number, reason: Buffer) => console.log(`Sarvam WS closed for [${speakerName}] code=${code} reason=${reason}`));
+
+	return ws;
+}
+
+// ── Socket.io Cluster Adapter (Redis) ────────────────────────
+if (process.env.REDIS_URL) {
+	const pubClient = createClient({ url: process.env.REDIS_URL });
+	const subClient = pubClient.duplicate();
+	Promise.all([pubClient.connect(), subClient.connect()]).then(() => {
+		io.adapter(createAdapter(pubClient, subClient));
+		console.log('📡 Socket.io Redis adapter connected');
+	}).catch(err => {
+		console.error('❌ Redis adapter connection failed:', err);
+	});
+}
+
+// Global set of transcribing meetings (stored in Redis for cluster sync)
+// For simplicity in this implementation, we use a naming convention:
+// Redis key: "transcription:active:<meetingId>"
+async function isMeetingTranscribing(meetingId: string) {
+	if (process.env.REDIS_URL) {
+		const client = createClient({ url: process.env.REDIS_URL });
+		await client.connect();
+		const active = await client.get(`transcription:active:${meetingId}`);
+		await client.quit();
+		return active === 'true';
+	}
+	return transcriptionSessions.has(meetingId);
+}
+
+async function setTranscriptionActive(meetingId: string, active: boolean) {
+	if (process.env.REDIS_URL) {
+		const client = createClient({ url: process.env.REDIS_URL });
+		await client.connect();
+		if (active) await client.set(`transcription:active:${meetingId}`, 'true', { EX: 86400 }); // 24h safety expiry
+		else await client.del(`transcription:active:${meetingId}`);
+		await client.quit();
+	}
+}
+
+// ── Socket.io event handlers ─────────────────────────────────
+io.on('connection', (socket: any) => {
+	connectedUsers.set(socket.userId, socket.id);
+	socket.join(`user:${socket.userId}`);
+
+	// WebRTC Signaling
+	socket.on('join_room', async ({ meetingId, name, profileImage }: any) => {
+		if (!meetingId) return;
+		const access = await canJoinMeetingNow(meetingId, socket.userId);
+		if (!access.ok) {
+			socket.emit('error', { message: access.reason || 'You are not allowed to join this meeting.' });
+			return;
+		}
+		socket.join(`meeting:${meetingId}`);
+
+		if (!meetingRooms.has(meetingId)) meetingRooms.set(meetingId, new Map());
+		const room = meetingRooms.get(meetingId)!;
+
+		const existingPeers: any[] = [];
+		for (const [sid, info] of room.entries()) {
+			existingPeers.push({ socketId: sid, userId: info.userId, name: info.name, profileImage: info.profileImage });
+		}
+
+		room.set(socket.id, { userId: socket.userId, name: name || 'User', profileImage: profileImage || null });
+		
+		// Set properties for transcription name resolution
+		socket.userName = name || 'User';
+		socket.profileImage = profileImage || null;
+
+		// #region agent log
+		console.log('[MCMS-DEBUG-SERVER]', JSON.stringify({
+			hypothesisId: 'H3',
+			event: 'join_room',
+			pid: process.pid,
+			meetingId: String(meetingId),
+			existingPeerCount: existingPeers.length,
+			newSocketId: socket.id,
+		}));
+		// #endregion
+
+		if (usingMongoFlag && Attendance) {
+			try {
+				await Attendance.findOneAndUpdate(
+					{ meetingId, userId: socket.userId },
+					{
+						$setOnInsert: {
+							joinTimestamp: new Date(),
+							method: 'auto',
+							punctual: null,
+							leaveTimestamp: null,
+						},
+					},
+					{ upsert: true },
+				);
+			} catch (err: any) {
+				console.warn('Attendance upsert on join_room:', err?.message);
+			}
+		}
+
+		socket.emit('room_peers', { peers: existingPeers });
+		socket.to(`meeting:${meetingId}`).emit('peer_joined', {
+			socketId: socket.id, userId: socket.userId,
+			name: name || 'User', profileImage: profileImage || null,
+		});
+
+		const session = transcriptionSessions.get(meetingId);
+		if (session && session.active) {
+			socket.emit('transcription_started', { meetingId });
+			// Open a WS for this late joiner. The audio_chunk handler already
+			// handles reconnection if WS is null or closes, so a failed open
+			// here is not fatal — we still add the speaker entry.
+			const ws = createSarvamWS(meetingId, socket.id, name || 'User', profileImage || null);
+			session.speakers.set(socket.id, {
+				userId: socket.userId,
+				ws, name: name || 'User', image: profileImage || null, streamBuffer: '',
+			});
+		}
+	});
+
+	socket.on('signal', ({ to, signal }: any) => {
+		// #region agent log
+		console.log('[MCMS-DEBUG-SERVER]', JSON.stringify({
+			hypothesisId: 'H3',
+			event: 'signal_relay',
+			pid: process.pid,
+			from: socket.id,
+			to,
+			signalType: signal?.type,
+		}));
+		// #endregion
+		io.to(to).emit('signal', { from: socket.id, signal });
+	});
+
+	socket.on('leave_room', ({ meetingId }: any) => {
+		if (!meetingId) return;
+		socket.leave(`meeting:${meetingId}`);
+		const room = meetingRooms.get(meetingId);
+		if (room) { room.delete(socket.id); if (room.size === 0) meetingRooms.delete(meetingId); }
+		socket.to(`meeting:${meetingId}`).emit('peer_left', { socketId: socket.id });
+
+		const session = transcriptionSessions.get(meetingId);
+		if (session && session.speakers.has(socket.id)) {
+			const sp = session.speakers.get(socket.id);
+			const agg = session.aggregator;
+			if (agg && sp && sp.name === agg.speaker) {
+				flushSessionAggregator(meetingId, session);
+			}
+			if (sp.ws && sp.ws.readyState === WebSocket.OPEN) sp.ws.close();
+			session.speakers.delete(socket.id);
+		}
+	});
+
+	// transcription control
+	socket.on('start_transcription', async ({ meetingId }: any) => {
+		if (!meetingId) return;
+		if (!(await isMeetingHost(meetingId, socket.userId))) {
+			socket.emit('error', { message: 'Only the host can start recording.' });
+			return;
+		}
+		resumeClock(meetingRecordingClock, meetingId);
+
+		// Initialize local session for this instance
+		const speakers = new Map<string, any>();
+		transcriptionSessions.set(meetingId, { active: true, speakers, aggregator: null, liveDraftId: null });
+		
+		// Set global state in Redis so other instances know to start Sarvam WS on audio_chunks
+		await setTranscriptionActive(meetingId, true);
+		
+		// Notify all participants across all instances to start sending audio_chunks
+		if (io) io.to(`meeting:${meetingId}`).emit('transcription_started', { meetingId });
+	});
+
+	socket.on('stop_transcription', async ({ meetingId }: any) => {
+		if (!meetingId) return;
+		if (!(await isMeetingHost(meetingId, socket.userId))) {
+			socket.emit('error', { message: 'Only the host can stop recording.' });
+			return;
+		}
+		const session = transcriptionSessions.get(meetingId);
+		if (session) {
+			flushSessionAggregator(meetingId, session);
+			for (const [, sp] of session.speakers) {
+				if (sp.ws && sp.ws.readyState === WebSocket.OPEN) sp.ws.close();
+			}
+			session.active = false;
+			session.speakers.clear();
+		}
+		await setTranscriptionActive(meetingId, false);
+		pauseClock(meetingRecordingClock, meetingId);
+		transcriptionSessions.delete(meetingId);
+		io.to(`meeting:${meetingId}`).emit('transcription_stopped', { meetingId });
+	});
+
+	/** Client-side VAD speaking time (no Sarvam); only accepted while socket is in the meeting room. */
+	socket.on('speaking_vad_report', async ({ meetingId, deltaMs }: any) => {
+		if (!meetingId || !socket.userId) return;
+		// Since we use LiveKit, we can rely on the user being in the meeting if they have the meetingId.
+		// For extra security, we could verify participant status in DB, but VAD reporting is non-sensitive.
+		const raw = Number(deltaMs);
+		if (!Number.isFinite(raw) || raw < 400) return;
+		const cappedMs = Math.min(raw, 90_000);
+		const incSec = Math.round(cappedMs / 1000);
+		if (incSec < 1) return;
+		if (!(usingMongoFlag && Attendance)) return;
+		try {
+			await Attendance.findOneAndUpdate(
+				{ meetingId, userId: socket.userId },
+				{
+					$inc: { speakingSecondsTotal: incSec },
+					$setOnInsert: {
+						joinTimestamp: new Date(),
+						method: 'auto',
+						punctual: null,
+						leaveTimestamp: null,
+					},
+				},
+				{ upsert: true },
+			);
+		} catch (err: any) {
+			console.warn('speaking_vad_report:', err?.message);
+		}
+	});
+
+	socket.on('audio_chunk', async ({ meetingId, data }: any) => {
+		if (!meetingId || !data) return;
+		
+		let session = transcriptionSessions.get(meetingId);
+		if (!session) {
+			const isGlobalActive = await isMeetingTranscribing(meetingId);
+			if (isGlobalActive) {
+				session = { active: true, speakers: new Map(), aggregator: null, liveDraftId: null };
+				transcriptionSessions.set(meetingId, session);
+			} else {
+				return;
+			}
+		}
+
+		if (!session.active) return;
+
+		let sp = session.speakers.get(socket.id);
+		if (!sp || !sp.ws || sp.ws.readyState === WebSocket.CLOSED || sp.ws.readyState === WebSocket.CLOSING) {
+			// Cross-instance or reconnection chunk
+			// We need user name/image for Sarvam metadata. If not on socket, use placeholder
+			const spName = socket.userName || 'User';
+			const ws = createSarvamWS(meetingId, socket.id, spName, null);
+			sp = {
+				userId: socket.userId,
+				ws, name: spName, image: null, streamBuffer: sp?.streamBuffer || '',
+			};
+			session.speakers.set(socket.id, sp);
+		}
+
+		if (sp.ws && sp.ws.readyState === WebSocket.OPEN) {
+			try {
+				sp.ws.send(JSON.stringify({ audio: { data, sample_rate: '16000', encoding: 'audio/wav' } }));
+			} catch { }
+		}
+	});
+
+	// agenda sync
+	socket.on('agenda_action', async ({ meetingId, action, itemId }: any) => {
+		if (!meetingId || !action || !itemId) return;
+		try {
+			if (usingMongoFlag && Agenda) {
+				const agenda = await Agenda.findOne({ meetingId });
+				if (!agenda) return;
+
+				const item = agenda.items.find((i: any) => i.id === itemId);
+				if (!item) return;
+
+				if (action === 'start') {
+					for (const i of agenda.items) {
+						if (i.status === 'active') i.status = 'paused';
+					}
+					item.status = 'active';
+					item.startedAt = new Date();
+					agenda.activeItemId = itemId;
+					activeAgendaItems.set(meetingId, itemId);
+				} else if (action === 'pause') {
+					item.status = 'paused';
+					agenda.activeItemId = null;
+					activeAgendaItems.delete(meetingId);
+				} else if (action === 'complete') {
+					item.status = 'completed';
+					item.completedAt = new Date();
+					if (agenda.activeItemId === itemId) {
+						agenda.activeItemId = null;
+						activeAgendaItems.delete(meetingId);
+					}
+				}
+
+				await agenda.save();
+				io.to(`meeting:${meetingId}`).emit('agenda_sync', {
+					meetingId, items: agenda.items,
+					activeItemId: agenda.activeItemId,
+				});
+			} else {
+				const items = inMemoryAgendas[meetingId];
+				if (!items) return;
+				const item = items.find((i: any) => i.id === itemId);
+				if (!item) return;
+
+				if (action === 'start') {
+					items.forEach((i: any) => { if (i.status === 'active') i.status = 'paused'; });
+					item.status = 'active';
+					activeAgendaItems.set(meetingId, itemId);
+				} else if (action === 'pause') {
+					item.status = 'paused';
+					activeAgendaItems.delete(meetingId);
+				} else if (action === 'complete') {
+					item.status = 'completed';
+					activeAgendaItems.delete(meetingId);
+				}
+
+				io.to(`meeting:${meetingId}`).emit('agenda_sync', {
+					meetingId, items,
+					activeItemId: activeAgendaItems.get(meetingId) || null,
+				});
+			}
+		} catch (err: any) {
+			console.error('agenda_action error:', err.message);
+		}
+	});
+
+	// end meeting — only the host may end the meeting for everyone
+	socket.on('end_meeting', async ({ meetingId }: any) => {
+		if (!meetingId) return;
+		try {
+			// Host authorisation check
+			if (usingMongoFlag && Meeting) {
+				const meetingDoc = await Meeting.findById(meetingId).select('hostId');
+				if (meetingDoc && meetingDoc.hostId && meetingDoc.hostId.toString() !== socket.userId.toString()) {
+					socket.emit('error', { message: 'Only the host can end the meeting.' });
+					return;
+				}
+			} else {
+				const memMtg = inMemoryMeetings.find((m: any) => String(m.id || m._id) === String(meetingId));
+				if (memMtg && memMtg.hostId && String(memMtg.hostId) !== String(socket.userId)) {
+					socket.emit('error', { message: 'Only the host can end the meeting.' });
+					return;
+				}
+			}
+			if (usingMongoFlag && Meeting) {
+				const meeting = await Meeting.findById(meetingId).populate('participants');
+				if (meeting && meeting.status !== 'completed') {
+					meeting.status = 'completed';
+					await meeting.save();
+
+					// Auto-extract action items from transcript
+					try {
+						const transcripts = await Transcript.find({ meetingId }).sort({ startTime: 1, createdAt: 1 });
+						if (transcripts.length > 0) {
+							const fullText = transcripts.map((t: any) => `${t.speaker}: ${t.text}`).join('\n');
+							const agenda = await Agenda.findOne({ meetingId });
+							const agendaItems = agenda ? agenda.items : [];
+							const minutesDoc = await Minutes.findOne({ meetingId });
+
+							try {
+								const actions = await callAIExtractActions(fullText, minutesDoc ? minutesDoc.items : []);
+								const hostId = meeting.hostId;
+								let meetingUsers: any[] = [];
+								if (hostId) {
+									const host = await User.findById(hostId);
+									if (host) meetingUsers.push(host);
+								}
+								if (meeting.participants) meetingUsers.push(...meeting.participants);
+
+								for (const a of actions) {
+									let assigneeId = null;
+									if (a.assignee) {
+										const safeAssignee = a.assignee.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+										const extracted = a.assignee.trim().toLowerCase();
+										
+										const matchedParticipant = meetingUsers.find((u: any) => {
+											const userName = (u.name || '').toLowerCase();
+											const userEmail = (u.email || '').toLowerCase();
+											return userName === extracted ||
+												userEmail === extracted ||
+												userName.includes(extracted) ||
+												extracted.includes(userName);
+										});
+
+										if (matchedParticipant) {
+											assigneeId = matchedParticipant._id;
+										} else if (User) {
+											const globalUser = await User.findOne({
+												$or: [
+													{ name: { $regex: new RegExp(`^${safeAssignee}$`, 'i') } },
+													{ name: { $regex: new RegExp(safeAssignee, 'i') } },
+													{ email: { $regex: new RegExp(`^${safeAssignee}$`, 'i') } }
+												]
+											});
+											if (globalUser) assigneeId = globalUser._id;
+										}
+									}
+
+									await ActionItem.create({
+										meetingId,
+										title: a.title,
+										assigneeName: a.assignee || null,
+										assignee: assigneeId,
+										category: a.category || 'Technical',
+										status: 'pending',
+										deadline: a.deadline || null,
+										source: 'ai-extracted',
+										aiConfidence: a.confidence || null,
+									});
+								}
+								if (io) {
+									const dbItems = await ActionItem.find({ meetingId }).populate('assignee', 'name email').sort({ createdAt: 1 });
+									const processed = dbItems.map((item: any) => ({
+										id: (item._id || item.id).toString(),
+										title: item.title,
+										assignee: item.assigneeName || item.assignee?.name || 'Unassigned',
+										assigneeId: (item.assignee?._id || item.assignee)?.toString(),
+										category: item.category,
+										status: item.status,
+										deadline: item.deadline,
+										meetingId: meetingId.toString(),
+									}));
+									io.to(`meeting:${meetingId}`).emit('action_items_sync', { meetingId, items: processed });
+								}
+							} catch (e: any) {
+								console.error('AI action extraction failed:', e.message);
+							}
+
+							try {
+								await callAISummarize(
+									transcripts.map((t: any) => ({ text: t.text, speaker: t.speaker, agendaItemId: t.agendaItemId })),
+									agendaItems.map((i: any) => ({ id: i.id, title: i.title }))
+								);
+							} catch (e: any) {
+								console.error('AI summarization failed:', e.message);
+							}
+
+							try {
+								const latestActionItems = await ActionItem.find({ meetingId }).populate('assignee', 'name email').sort({ createdAt: 1 });
+								const storedSummary = await callAIMeetingSummary({
+									meeting_title: meeting.title,
+									segments: transcripts.map((t: any) => ({
+										text: t.text,
+										speaker: t.speaker,
+										agendaItemId: t.agendaItemId,
+									})),
+									agenda_items: agendaItems.map((i: any) => ({ id: i.id, title: i.title })),
+									minutes_items: ((minutesDoc as any)?.items || []).map((item: any) => ({
+										id: item.id,
+										title: item.title,
+										status: item.status,
+										notes: item.notes || '',
+										duration: item.duration,
+									})),
+									action_items: latestActionItems.map((item: any) => ({
+										title: item.title,
+										status: item.status,
+										assignee: item.assigneeName || item.assignee?.name || null,
+										deadline: item.deadline || null,
+										category: item.category || null,
+									})),
+								});
+
+								await MeetingSummary.findOneAndUpdate(
+									{ meetingId },
+									{
+										meetingId,
+										overview: storedSummary.overview || '',
+										discussionPoints: storedSummary.discussion_points || [],
+										completedItems: storedSummary.completed_items || [],
+										pendingItems: storedSummary.pending_items || [],
+										decisions: storedSummary.decisions || [],
+										nextSteps: storedSummary.next_steps || [],
+										model: storedSummary.model || 'unknown',
+										generatedAt: new Date(),
+									},
+									{ upsert: true, new: true }
+								);
+							} catch (e: any) {
+								console.error('AI meeting summary persistence failed:', e.message);
+							}
+						}
+					} catch (e: any) {
+						console.error('Post-meeting AI processing error:', e.message);
+					}
+
+					// Notify participants
+					const participants = meeting.participants || [];
+					for (const pid of participants) {
+						try {
+							const notif = await Notification.create({
+								userId: pid, type: 'meeting_summary_ready',
+								meetingId, message: `Summary ready for "${meeting.title}"`,
+							});
+							emitToUser(pid, 'notification', {
+								_id: notif._id, type: notif.type,
+								meetingId, message: notif.message,
+								read: false, createdAt: notif.createdAt,
+							});
+						} catch (e) { /* non-critical */ }
+					}
+				}
+			} else {
+				// In-memory fallback
+				const memMeeting = inMemoryMeetings.find((m: any) => String(m.id || m._id) === String(meetingId));
+				if (memMeeting && memMeeting.status !== 'completed') {
+					memMeeting.status = 'completed';
+					console.log(`[Socket] Meeting ${meetingId} manually ended (In-Memory).`);
+
+					try {
+						const transcripts = inMemoryTranscripts[meetingId] || [];
+						if (transcripts.length > 0) {
+							const fullText = transcripts.map((t: any) => `${t.speaker}: ${t.text}`).join('\n');
+							const agendaItems = inMemoryAgendas[meetingId] || [];
+							const minutesItems = inMemoryMinutes[meetingId] || [];
+
+							try {
+								const actions = await callAIExtractActions(fullText, minutesItems);
+								if (!inMemoryActionItems[meetingId]) inMemoryActionItems[meetingId] = [];
+								for (const a of actions) {
+									inMemoryActionItems[meetingId].push({
+										id: `ai-post-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+										title: a.title,
+										assignee: a.assignee || 'Unassigned',
+										category: a.category || 'Technical',
+										status: 'pending',
+										deadline: a.deadline || null,
+										source: 'ai-extracted',
+										aiConfidence: a.confidence || null,
+									});
+								}
+							} catch (e: any) {
+								console.error('In-memory AI action extraction failed:', e.message);
+							}
+
+							try {
+								await callAISummarize(
+									transcripts.map((t: any) => ({ text: t.text, speaker: t.speaker, agendaItemId: t.agendaItemId })),
+									agendaItems.map((i: any) => ({ id: i.id, title: i.title }))
+								);
+							} catch (e: any) {
+								console.error('In-memory AI summarization failed:', e.message);
+							}
+
+							try {
+								const storedSummary = await callAIMeetingSummary({
+									meeting_title: memMeeting.title,
+									segments: transcripts.map((t: any) => ({
+										text: t.text, speaker: t.speaker, agendaItemId: t.agendaItemId,
+									})),
+									agenda_items: agendaItems.map((i: any) => ({ id: i.id, title: i.title })),
+									minutes_items: minutesItems.map((item: any) => ({
+										id: item.id, title: item.title, status: item.status,
+										notes: item.notes || '', duration: item.duration,
+									})),
+									action_items: (inMemoryActionItems[meetingId] || []).map((item: any) => ({
+										title: item.title, status: item.status, assignee: item.assignee, category: item.category,
+									})),
+								});
+
+								inMemoryMeetingSummaries[meetingId] = {
+									meetingId,
+									overview: storedSummary.overview || '',
+									discussionPoints: storedSummary.discussion_points || [],
+									completedItems: storedSummary.completed_items || [],
+									pendingItems: storedSummary.pending_items || [],
+									decisions: storedSummary.decisions || [],
+									nextSteps: storedSummary.next_steps || [],
+									model: storedSummary.model || 'unknown',
+									generatedAt: new Date(),
+								};
+							} catch (e: any) {
+								console.error('In-memory AI meeting summary persistence failed:', e.message);
+							}
+						}
+					} catch (e: any) {
+						console.error('In-memory post-meeting AI processing error:', e.message);
+					}
+				}
+			}
+
+			io.to(`meeting:${meetingId}`).emit('meeting_ended', { meetingId });
+
+			// Kick all peers out of the WebRTC room
+			const room = meetingRooms.get(meetingId);
+			if (room) {
+				for (const [sid] of room) {
+					io.to(`meeting:${meetingId}`).emit('peer_left', { socketId: sid });
+				}
+				meetingRooms.delete(meetingId);
+			}
+
+			// Tear down any active transcription session
+			const session = transcriptionSessions.get(meetingId);
+			if (session) {
+				flushSessionAggregator(meetingId, session);
+				for (const [, sp] of session.speakers) {
+					if (sp.ws && sp.ws.readyState === WebSocket.OPEN) sp.ws.close();
+				}
+				transcriptionSessions.delete(meetingId);
+			}
+			pauseClock(meetingRecordingClock, meetingId);
+			clearMeetingClock(meetingRecordingClock, meetingId);
+		} catch (err: any) {
+			console.error('end_meeting error:', err.message);
+		}
+	});
+
+	socket.on('join_meeting', ({ meetingId, name, profileImage }: any) => {
+		if (meetingId) {
+			socket.join(`meeting:${meetingId}`);
+			// Persist metadata for transcription segments
+			socket.userName = name || (socket as any).user?.name || 'User';
+			socket.profileImage = profileImage || null;
+		}
+	});
+	socket.on('leave_meeting', ({ meetingId }: any) => { if (meetingId) socket.leave(`meeting:${meetingId}`); });
+
+	socket.on('disconnect', () => {
+		connectedUsers.delete(socket.userId);
+		for (const [meetingId, room] of meetingRooms.entries()) {
+			if (room.has(socket.id)) {
+				room.delete(socket.id);
+				io.to(`meeting:${meetingId}`).emit('peer_left', { socketId: socket.id });
+
+				const session = transcriptionSessions.get(meetingId);
+				if (session && session.speakers.has(socket.id)) {
+					const sp = session.speakers.get(socket.id);
+					const agg = session.aggregator;
+					if (agg && sp && sp.name === agg.speaker) {
+						flushSessionAggregator(meetingId, session);
+					}
+					if (sp.ws && sp.ws.readyState === WebSocket.OPEN) sp.ws.close();
+					session.speakers.delete(socket.id);
+				}
+
+				if (room.size === 0) {
+					meetingRooms.delete(meetingId);
+					if (session) {
+						flushSessionAggregator(meetingId, session);
+						for (const [, sp] of session.speakers) {
+							if (sp.ws && sp.ws.readyState === WebSocket.OPEN) sp.ws.close();
+						}
+						transcriptionSessions.delete(meetingId);
+					}
+					pauseClock(meetingRecordingClock, meetingId);
+					clearMeetingClock(meetingRecordingClock, meetingId);
+				}
+			}
+		}
+	});
+});
+
+// ── Pre-meeting brief cron (every hour) ──────────────────────
+const { generateBrief, formatBriefEmail } = require('./services/briefGenerator');
+
+cron.schedule('0 * * * *', async () => {
+	if (!usingMongoFlag || !Meeting) return;
+	try {
+		const now = new Date();
+		const in24h = new Date(now.getTime() + 25 * 3600000);
+		const in23h = new Date(now.getTime() + 23 * 3600000);
+
+		const meetings = await Meeting.find({
+			status: 'scheduled',
+			confirmedDate: {
+				$gte: in23h.toISOString().split('T')[0],
+				$lte: in24h.toISOString().split('T')[0],
+			},
+		}).populate('participants', 'name email');
+
+		for (const meeting of meetings) {
+			try {
+				const brief = await generateBrief(meeting, callAISummarize);
+				const html = formatBriefEmail(brief, meeting._id, CLIENT_URL);
+				const transport = await getMailTransporter();
+
+				for (const p of meeting.participants) {
+					await transport.sendMail({
+						from: process.env.SMTP_FROM || '"MCMS Platform" <noreply@mcms.app>',
+						to: p.email,
+						subject: `Pre-Meeting Brief: ${meeting.title}`,
+						html,
+					});
+
+					try {
+						await Notification.create({
+							userId: p._id, type: 'brief_ready',
+							meetingId: meeting._id,
+							message: `Pre-meeting brief ready for "${meeting.title}"`,
+						});
+						emitToUser(p._id, 'notification', {
+							type: 'brief_ready', meetingId: meeting._id,
+							message: `Pre-meeting brief ready for "${meeting.title}"`,
+							read: false,
+						});
+					} catch (e) { /* non-critical */ }
+				}
+				console.log(`Brief sent for: ${meeting.title}`);
+			} catch (e: any) {
+				console.error(`Brief generation failed for ${meeting.title}:`, e.message);
+			}
+		}
+	} catch (e: any) {
+		console.error('Brief cron error:', e.message);
+	}
+});
+
+// ── LiveKit Token Endpoint ──────────────────────────────────
+app.get('/api/meetings/:id/token', protect, async (req: any, res: any) => {
+	try {
+		const apiKey = process.env.LIVEKIT_API_KEY;
+		const apiSecret = process.env.LIVEKIT_API_SECRET;
+		if (!apiKey || !apiSecret) {
+			return res.status(500).json({ message: 'LiveKit credentials not configured on server' });
+		}
+
+		const meetingId = req.params.id;
+		const userId = req.user.id;
+		const userName = req.user.name || 'User';
+
+		// Verify user is a participant of this meeting
+		let isParticipant = false;
+		if (usingMongoFlag && Meeting) {
+			const meeting = await Meeting.findById(meetingId);
+			if (meeting) {
+				const uid = String(userId);
+				const hostId = meeting.hostId ? String(meeting.hostId) : '';
+				const participants = Array.isArray(meeting.participants) ? meeting.participants : [];
+				const isHost = hostId === uid;
+				const isInvited = participants.some((p: any) => {
+					const pId = String(p?._id || p?.id || p || '');
+					return pId && pId === uid;
+				});
+				isParticipant = isHost || isInvited;
+			}
+		} else {
+			const memMtg = inMemoryMeetings.find((m: any) => String(m.id || m._id) === String(meetingId));
+			if (memMtg) {
+				const uid = String(userId);
+				isParticipant = String(memMtg.hostId) === uid || (memMtg.participants || []).some((p: any) => String(p) === uid);
+			}
+		}
+
+		if (!isParticipant) {
+			return res.status(403).json({ message: 'You are not a participant of this meeting' });
+		}
+
+		const at = new AccessToken(apiKey, apiSecret, {
+			identity: userId,
+			name: userName,
+		});
+		at.addGrant({ roomJoin: true, room: meetingId });
+
+		res.json({ token: await at.toJwt() });
+	} catch (error: any) {
+		res.status(500).json({ message: 'Server error generating token', error: error.message });
+	}
+});
+
+// ── Brief on-demand endpoint ─────────────────────────────────
+app.get('/api/meetings/:id/brief', protect, async (req: any, res: any) => {
+	try {
+		if (!usingMongoFlag || !Meeting) return res.status(400).json({ message: 'Database required' });
+		const meeting = await Meeting.findById(req.params.id);
+		if (!meeting) return res.status(404).json({ message: 'Meeting not found' });
+		const brief = await generateBrief(meeting, callAISummarize);
+		res.json(brief);
+	} catch (error: any) {
+		res.status(500).json({ message: 'Server error', error: error.message });
+	}
+});
+
+// ── Serve client build under /mcms (production) ──────────────
+const CLIENT_BUILD = path.join(__dirname, '..', '..', 'client', 'dist');
+app.use('/mcms', express.static(CLIENT_BUILD));
+app.get('/mcms/*path', (req: any, res: any) => {
+	res.sendFile(path.join(CLIENT_BUILD, 'index.html'));
+});
+
+	// start server
+	server.listen(PORT, () => {
+		console.log(`\n🚀 MCMS Backend running at http://localhost:${PORT}`);
+		console.log(`🤖 AI Service URL: ${process.env.AI_SERVICE_URL || 'http://localhost:8000'}`);
+		console.log(`📦 Storage: ${usingMongoFlag ? 'MongoDB (Persistent)' : 'In-Memory (Volatile)'}`);
+		console.log(`📡 WebRTC signaling uses in-memory rooms: run exactly ONE server instance (scale=1 on your host). Multiple processes cannot see each other’s sockets without a Socket.IO cluster adapter.\n`);
+	});
+}
+
+runApplication();

@@ -1,0 +1,74 @@
+const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:8000';
+
+async function callAISummarize(transcriptSegments: any[], agendaItems: any[]) {
+    try {
+        const resp = await fetch(`${AI_SERVICE_URL}/summarize`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ segments: transcriptSegments, agenda_items: agendaItems }),
+        });
+        if (!resp.ok) throw new Error(`AI service returned ${resp.status}`);
+        const data: any = await resp.json();
+        return data.summaries || {};
+    } catch (error: any) {
+        console.error('AI summarize call failed:', error.message);
+        throw error;
+    }
+}
+
+async function callAIExtractActions(transcriptText: string, minutesItems: any[] = []) {
+    try {
+        console.log(`[AI-SERVICE] Sending POST to ${AI_SERVICE_URL}/extract-actions`);
+        const resp = await fetch(`${AI_SERVICE_URL}/extract-actions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: transcriptText, minutes_items: minutesItems }),
+        });
+        if (!resp.ok) throw new Error(`AI service (${AI_SERVICE_URL}) returned ${resp.status}`);
+        const data: any = await resp.json();
+        return data.actions || [];
+    } catch (error: any) {
+        console.error(`AI extract-actions call failed for url ${AI_SERVICE_URL}:`, error.message);
+        throw error;
+    }
+}
+
+
+async function callAIMeetingSummary(payload: {
+    meeting_title?: string;
+    segments: any[];
+    agenda_items?: any[];
+    minutes_items?: any[];
+    action_items?: any[];
+}) {
+    try {
+        const resp = await fetch(`${AI_SERVICE_URL}/meeting-summary`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        if (!resp.ok) throw new Error(`AI service returned ${resp.status}`);
+        const data: any = await resp.json();
+        return data.summary || {};
+    } catch (error: any) {
+        console.error('AI meeting-summary call failed:', error.message);
+        throw error;
+    }
+}
+
+async function callAISentiment(text: string) {
+    try {
+        const resp = await fetch(`${AI_SERVICE_URL}/sentiment`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text }),
+        });
+        if (!resp.ok) throw new Error(`AI service returned ${resp.status}`);
+        return await resp.json();
+    } catch (error: any) {
+        console.error('AI sentiment call failed:', error.message);
+        throw error;
+    }
+}
+
+export { callAISummarize, callAIExtractActions, callAIMeetingSummary, callAISentiment };
