@@ -1566,7 +1566,7 @@ app.get('/mcms/*path', (req: any, res: any) => {
 });
 
 	// start server
-	server.listen(PORT, () => {
+	server.listen(PORT, '0.0.0.0', () => {
 		console.log(`\n🚀 MCMS Backend running at http://localhost:${PORT}`);
 		console.log(`🤖 AI Service URL: ${process.env.AI_SERVICE_URL || 'http://localhost:8000'}`);
 		console.log(`📦 Storage: ${usingMongoFlag ? 'MongoDB (Persistent)' : 'In-Memory (Volatile)'}`);
